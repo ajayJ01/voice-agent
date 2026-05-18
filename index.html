@@ -1,0 +1,521 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <!-- Disable browser cache so audio-pipeline tweaks always reach the user
+         without needing Ctrl+Shift+R. Required because we iterate on the
+         getUserMedia constraints (NS/AGC/EC) frequently during STT tuning. -->
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
+    <meta name="token-server-base" content="http://127.0.0.1:8787">
+    <title>AI Voice Assistant — STT Test</title>
+    <script src="https://cdn.jsdelivr.net/npm/livekit-client@2.15.3/dist/livekit-client.umd.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            min-height: 100vh; color: #fff; padding: 20px;
+            display: flex; align-items: center; justify-content: center;
+        }
+        .container {
+            width: 100%; max-width: 720px;
+            background: rgba(255,255,255,0.06);
+            border-radius: 20px; padding: 28px;
+            backdrop-filter: blur(8px);
+        }
+        h1 { font-size: 1.6rem; margin-bottom: 6px; }
+        .sub { color: #9aa3b2; margin-bottom: 18px; font-size: 0.9rem; }
+
+        #status {
+            font-size: 1rem; padding: 10px 14px; border-radius: 10px;
+            background: rgba(255,255,255,0.07); margin-bottom: 14px;
+            display: flex; align-items: center; gap: 10px;
+        }
+        #status .dot { width: 10px; height: 10px; border-radius: 50%; background: #888; }
+        #status.connected .dot { background: #2ecc71; box-shadow: 0 0 10px #2ecc71; }
+        #status.speaking .dot { background: #00d4ff; box-shadow: 0 0 10px #00d4ff; }
+        #status.thinking .dot { background: #f1c40f; box-shadow: 0 0 10px #f1c40f; }
+        #status.agent-speaking .dot { background: #7b2ff5; box-shadow: 0 0 10px #7b2ff5; }
+
+        .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin: 10px 0; }
+        select, button {
+            padding: 10px 14px; border-radius: 8px; border: 1px solid #2a3142;
+            background: #1f2436; color: #fff; font-size: 0.9rem; cursor: pointer;
+        }
+        select { min-width: 220px; flex: 1; }
+        button.primary {
+            background: linear-gradient(90deg, #00d4ff, #7b2ff5);
+            border: none; padding: 12px 28px; font-size: 1rem;
+        }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+        .meter {
+            height: 22px; background: rgba(255,255,255,0.08);
+            border-radius: 8px; overflow: hidden; margin-top: 6px;
+        }
+        .meter > div {
+            height: 100%; width: 0%;
+            background: linear-gradient(90deg, #2ecc71 0%, #2ecc71 60%, #f1c40f 75%, #e74c3c 90%);
+            transition: width 60ms linear;
+        }
+
+        .panel {
+            margin-top: 16px; padding: 14px;
+            background: rgba(0,0,0,0.25); border-radius: 12px;
+            border: 1px solid rgba(255,255,255,0.05);
+        }
+        .panel h3 { font-size: 0.85rem; color: #9aa3b2; font-weight: 600; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.5px; }
+        #transcript-final { font-size: 1rem; line-height: 1.5; min-height: 1.5em; color: #fff; }
+        #transcript-interim { font-size: 0.95rem; color: #7b8aa3; font-style: italic; min-height: 1.4em; }
+
+        .help {
+            margin-top: 14px; padding: 12px 14px;
+            background: rgba(241, 196, 15, 0.08);
+            border-left: 3px solid #f1c40f;
+            border-radius: 6px; font-size: 0.85rem; color: #f0d97a;
+        }
+        .help b { color: #fff; }
+
+        #log {
+            font-family: 'Consolas', monospace; font-size: 0.75rem;
+            color: #8a93a8; max-height: 180px; overflow-y: auto;
+            white-space: pre-wrap;
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>AI Voice Assistant</h1>
+    <div class="sub">Step 1: Mic → STT (LiveKit native audio path, just like Zoom/Meet)</div>
+
+    <div id="status"><span class="dot"></span><span id="status-text">Disconnected</span></div>
+
+    <div class="row">
+        <label style="font-size:0.85rem;color:#cfd5e1;">Mic:</label>
+        <select id="mic-select"></select>
+        <button id="refresh-mics">Refresh</button>
+    </div>
+    <div style="font-size:0.75rem;color:#9aa3b2;margin-top:-4px;">
+        ⚠ "Communications - " prefix waale device select <b>na karo</b> — Windows usme volume kam karta hai. Plain "Microphone (...)" select karo.
+    </div>
+
+    <div style="margin-top:14px;">
+        <div style="font-size:0.85rem;color:#cfd5e1;margin-bottom:4px;">
+            Mic input level — bolne par <b style="color:#2ecc71;">green-yellow zone</b> me hona chahiye
+        </div>
+        <div class="meter"><div id="level-bar"></div></div>
+    </div>
+
+    <div class="row" style="margin-top: 18px;">
+        <button id="connect-btn" class="primary">Connect & Start Talking</button>
+        <button id="disconnect-btn" disabled>Disconnect</button>
+    </div>
+
+    <div class="panel">
+        <h3>Live Transcript</h3>
+        <div id="transcript-final">—</div>
+        <div id="transcript-interim"></div>
+    </div>
+
+    <div class="help" id="low-mic-help" style="display:none;">
+        <div style="font-size:1rem;color:#fff;margin-bottom:8px;">
+            ⚠ <b>Mic level BAHUT kam hai — STT fail hoga</b>
+        </div>
+        Windows me mic volume + boost set karo (1-time setup):<br>
+        <b>1.</b> Win+R → type <code style="background:#000;padding:2px 6px;border-radius:3px;">mmsys.cpl</code> → Enter<br>
+        <b>2.</b> <b>Recording</b> tab → apna mic select → <b>Properties</b> button<br>
+        <b>3.</b> <b>Levels</b> tab:<br>
+        &nbsp;&nbsp;&nbsp;• Microphone slider → <b style="color:#fff;">100</b><br>
+        &nbsp;&nbsp;&nbsp;• Microphone Boost (agar option ho) → <b style="color:#fff;">+20 dB</b> ya <b style="color:#fff;">+30 dB</b><br>
+        <b>4.</b> <b>Enhancements</b> tab → ☑ <b>"Disable all enhancements"</b><br>
+        <b>5.</b> OK → page <b>Ctrl+Shift+R</b><br>
+        <div style="margin-top:8px;color:#9aa3b2;font-size:0.78rem;">
+            Bina ye fix kiye STT kabhi sahi se kaam nahi karega. AB13X jaise budget USB mic default pe -20dB pe boot hote hain.
+        </div>
+    </div>
+
+    <div class="panel">
+        <h3>Logs</h3>
+        <div id="log"></div>
+    </div>
+</div>
+
+<script>
+    const TOKEN_BASE = document.querySelector('meta[name="token-server-base"]').content;
+    const ROOM_NAME = "voice-room-main";
+
+    let room = null;
+    let localMicTrack = null;
+    let levelTimer = null;
+    let audioCtx = null;
+    let lowMicSamples = 0;
+    /** Merged text for Nova-style multi-final user utterances (same LiveKit turn). */
+    let userFinalMergeAcc = '';
+    let wasLocalSpeaking = false;
+
+    function mergeLocalUserFinals(prev, next) {
+        const a = (prev || '').trim();
+        const b = (next || '').trim();
+        if (!a) return b;
+        if (!b) return a;
+        if (b.includes(a)) return b;
+        if (a.includes(b)) return a;
+        return (a + ' ' + b).replace(/\s+/g, ' ').trim();
+    }
+
+    /** Keep in sync with agent.py multi-model romance-glue stripping (display only). */
+    const NOVA_ROMANCE_FRAGMENTS = [
+        'tioto', 'tahara', 'dermato', 'no seu', 'seu cute', 'por tahara', 'dermatolog',
+        'verdião', 'verdiao', 'tom de tow', 'una ver',
+        'panilla', 'surtillo', 'queda tu', 'merely panilla', 'solo batao', 'bharatunga',
+        'purdanum', 'purdanum mantri', 'sungry', 'tu mujer',
+    ];
+    function stripNovaRomanceGlueDisplay(text) {
+        let t = (text || '').replace(/\u00bf|\u00a1/g, '').trim();
+        if (!t) return t;
+        const chars = [...t];
+        const devIdx = chars.findIndex(c => c >= '\u0900' && c <= '\u097F');
+        if (devIdx > 0) {
+            const prefixRaw = t.slice(0, devIdx).trim();
+            const prefixLow = prefixRaw.toLowerCase();
+            const junk = NOVA_ROMANCE_FRAGMENTS.some((f) => prefixLow.includes(f))
+                || /^(por|una\s+ver)\b/i.test(prefixRaw);
+            if (junk) t = t.slice(devIdx).trim();
+        } else if (devIdx < 0) {
+            const low = t.toLowerCase();
+            if (NOVA_ROMANCE_FRAGMENTS.some((f) => low.includes(f))) return '';
+        }
+        return t;
+    }
+
+    /** English Hello → STT often emits Spanish Aló; strip repeated leading bits (display). */
+    function stripLeadingSpanishAloNoiseDisplay(text) {
+        let t = (text || '').trim();
+        if (!t) return t;
+        const re = /^(?:(?:\u00bf\s*)?Al[oó]\s*\??\.?\s*)+/gi;
+        let prev;
+        for (let i = 0; i < 8 && t !== prev; i++) {
+            prev = t;
+            t = t.replace(re, '').trim();
+        }
+        return t;
+    }
+
+    const $ = (id) => document.getElementById(id);
+    const statusEl = $('status');
+    const statusText = $('status-text');
+    const connectBtn = $('connect-btn');
+    const disconnectBtn = $('disconnect-btn');
+    const micSelect = $('mic-select');
+    const refreshBtn = $('refresh-mics');
+    const levelBar = $('level-bar');
+    const transcriptFinal = $('transcript-final');
+    const transcriptInterim = $('transcript-interim');
+    const logEl = $('log');
+    const lowMicHelp = $('low-mic-help');
+
+    function log(msg) {
+        const t = new Date().toLocaleTimeString();
+        logEl.textContent = `${t}  ${msg}\n` + logEl.textContent;
+    }
+
+    function setStatus(cls, text) {
+        statusEl.className = cls;
+        statusText.textContent = text;
+    }
+
+    async function loadMics() {
+        try {
+            const tmp = await navigator.mediaDevices.getUserMedia({ audio: true });
+            tmp.getTracks().forEach(t => t.stop());
+        } catch (e) {
+            log("Mic permission denied: " + e.message);
+            return;
+        }
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const mics = devices.filter(d => d.kind === 'audioinput');
+        micSelect.innerHTML = '';
+        // Show a "system default" option first so user doesn't have to pick.
+        const def = document.createElement('option');
+        def.value = '';
+        def.textContent = '(System default mic)';
+        micSelect.appendChild(def);
+        mics.forEach(d => {
+            const label = d.label || `Mic ${d.deviceId.slice(0, 6)}`;
+            // Mark Communications devices but still allow them.
+            const isComms = label.toLowerCase().startsWith('communications');
+            const opt = document.createElement('option');
+            opt.value = d.deviceId;
+            opt.textContent = isComms ? `⚠ ${label}` : label;
+            micSelect.appendChild(opt);
+        });
+        log(`Found ${mics.length} mic(s) — use system default for best results`);
+    }
+    refreshBtn.onclick = loadMics;
+    loadMics();
+
+    function startLevelMeter(mediaStreamTrack) {
+        if (levelTimer) clearInterval(levelTimer);
+        if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const ms = new MediaStream([mediaStreamTrack]);
+        const source = audioCtx.createMediaStreamSource(ms);
+        const analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 1024;
+        source.connect(analyser);
+
+        const data = new Uint8Array(analyser.fftSize);
+        lowMicSamples = 0;
+        let highestSeen = 0;
+        let helpAlreadyShown = false;
+        let lastBytesSent = 0;
+        let lastPacketsSent = 0;
+        levelTimer = setInterval(() => {
+            analyser.getByteTimeDomainData(data);
+            let sum = 0;
+            for (let i = 0; i < data.length; i++) {
+                const v = (data[i] - 128) / 128;
+                sum += v * v;
+            }
+            const rms = Math.sqrt(sum / data.length);
+            const pct = Math.min(100, rms * 250);
+            levelBar.style.width = pct + '%';
+            if (pct > highestSeen) highestSeen = pct;
+
+            lowMicSamples++;
+            if (lowMicSamples % 75 === 0) {
+                if (highestSeen < 30 && !helpAlreadyShown) {
+                    lowMicHelp.style.display = 'block';
+                    helpAlreadyShown = true;
+                    log(`⚠ Mic level too low (peak ${highestSeen.toFixed(1)}%) — STT will fail. Fix Windows mic level (see help box).`);
+                } else if (highestSeen >= 35 && helpAlreadyShown) {
+                    lowMicHelp.style.display = 'none';
+                    helpAlreadyShown = false;
+                    log(`✅ Mic level recovered (peak ${highestSeen.toFixed(1)}%)`);
+                } else if (lowMicSamples === 75) {
+                    log(`Mic peak so far: ${highestSeen.toFixed(1)}% (need ≥30% for good STT)`);
+                }
+
+                // Verify the publish path is alive: check track muted state
+                // and per-window outbound RTP delta. If pct shows ~30%+ but
+                // no packets are leaving, browser/LiveKit is the bottleneck.
+                if (localMicTrack && localMicTrack.mediaStreamTrack) {
+                    const muted = localMicTrack.mediaStreamTrack.muted;
+                    const enabled = localMicTrack.mediaStreamTrack.enabled;
+                    const rs = localMicTrack.mediaStreamTrack.readyState;
+                    if (muted || !enabled || rs !== 'live') {
+                        log(`⚠ Track unhealthy: muted=${muted} enabled=${enabled} readyState=${rs}`);
+                    }
+                }
+                if (room && room.engine && room.engine.pcManager) {
+                    room.engine.pcManager.publisher
+                        ?.getStats()
+                        .then((stats) => {
+                            stats.forEach((report) => {
+                                if (report.type === 'outbound-rtp' && report.kind === 'audio') {
+                                    const dBytes = report.bytesSent - lastBytesSent;
+                                    const dPackets = report.packetsSent - lastPacketsSent;
+                                    lastBytesSent = report.bytesSent;
+                                    lastPacketsSent = report.packetsSent;
+                                    if (dPackets === 0) {
+                                        log(`⚠ NO audio packets sent in last 6s — browser publish stalled!`);
+                                    } else {
+                                        log(`Audio publish OK: +${dPackets} pkts, +${dBytes} bytes (last 6s)`);
+                                    }
+                                }
+                            });
+                        })
+                        .catch(() => { /* stats unavailable */ });
+                }
+
+                highestSeen = 0;
+            }
+        }, 80);
+    }
+
+    function stopLevelMeter() {
+        if (levelTimer) { clearInterval(levelTimer); levelTimer = null; }
+        levelBar.style.width = '0%';
+        lowMicHelp.style.display = 'none';
+    }
+
+    function attachRoomListeners() {
+        room.on(LivekitClient.RoomEvent.TrackSubscribed, (track) => {
+            if (track.kind === 'audio') {
+                const audio = new Audio();
+                audio.autoplay = true;
+                audio.playsInline = true;
+                track.attach(audio);
+                document.body.appendChild(audio);
+                log("Agent audio track received");
+                // Do NOT mute the local mic during agent TTS. We tried
+                // ActiveSpeakersChanged-based gating; LiveKit's active
+                // speaker signal is too flaky — it often leaves the
+                // mic disabled while the user is talking (zeros sent to
+                // Deepgram → STT_NO_TRANSCRIPT). Echo during playback
+                // is handled server-side (discard_audio_if_uninterruptible
+                // + EC on the client track).
+            }
+        });
+
+        room.on(LivekitClient.RoomEvent.TranscriptionReceived, (segments, participant) => {
+            const isLocal = participant && participant.identity === room.localParticipant.identity;
+            segments.forEach(seg => {
+                const text = (seg.text || '').trim();
+                if (!text) return;
+                if (isLocal) {
+                    if (seg.final) {
+                        const piece = stripLeadingSpanishAloNoiseDisplay(
+                            stripNovaRomanceGlueDisplay(text));
+                        userFinalMergeAcc = stripLeadingSpanishAloNoiseDisplay(
+                            mergeLocalUserFinals(userFinalMergeAcc, piece));
+                        transcriptFinal.textContent = userFinalMergeAcc;
+                        transcriptInterim.textContent = '';
+                        log(`USER FINAL: "${userFinalMergeAcc}"`);
+                    } else {
+                        transcriptInterim.textContent = stripLeadingSpanishAloNoiseDisplay(
+                            stripNovaRomanceGlueDisplay(text));
+                    }
+                } else {
+                    log(`AGENT ${seg.final ? 'FINAL' : 'interim'}: "${text}"`);
+                }
+            });
+        });
+
+        room.on(LivekitClient.RoomEvent.ActiveSpeakersChanged, (speakers) => {
+            const localId = room.localParticipant.identity;
+            const localSpeaking = speakers.some(s => s.identity === localId);
+            const remoteSpeaking = speakers.some(s => s.identity !== localId);
+            if (localSpeaking && !wasLocalSpeaking) {
+                userFinalMergeAcc = '';
+                transcriptFinal.textContent = '';
+            }
+            wasLocalSpeaking = localSpeaking;
+            if (remoteSpeaking) setStatus('agent-speaking', 'Agent speaking...');
+            else if (localSpeaking) setStatus('speaking', 'You are speaking...');
+            else setStatus('connected', 'Connected — listening');
+        });
+
+        room.on(LivekitClient.RoomEvent.Disconnected, () => {
+            setStatus('', 'Disconnected');
+            connectBtn.disabled = false;
+            disconnectBtn.disabled = true;
+            stopLevelMeter();
+            userFinalMergeAcc = '';
+            wasLocalSpeaking = false;
+            log("Disconnected from room");
+        });
+
+        room.on(LivekitClient.RoomEvent.LocalTrackUnpublished, (publication) => {
+            log(`Local track unpublished: ${publication.trackName || publication.kind}`);
+        });
+    }
+
+    connectBtn.onclick = async () => {
+        connectBtn.disabled = true;
+        userFinalMergeAcc = '';
+        wasLocalSpeaking = false;
+        try {
+            setStatus('', 'Fetching token...');
+            const identity = `web-${Date.now()}`;
+            const url = `${TOKEN_BASE}/token?identity=${identity}&room=${ROOM_NAME}`;
+            const res = await fetch(url);
+            if (!res.ok) throw new Error(`Token server ${res.status}`);
+            const { url: lkUrl, token } = await res.json();
+            log(`Got token for room=${ROOM_NAME}`);
+
+            room = new LivekitClient.Room({
+                adaptiveStream: true,
+                dynacast: true,
+                publishDefaults: {
+                    audioPreset: LivekitClient.AudioPresets.speech,
+                    dtx: false,
+                    red: false,
+                },
+            });
+            attachRoomListeners();
+
+            setStatus('', 'Connecting to LiveKit...');
+            await room.connect(lkUrl, token);
+            log(`Connected: ${room.name}`);
+
+            setStatus('', 'Publishing mic...');
+            const deviceId = micSelect.value || undefined;
+            // We bypass LivekitClient.createLocalAudioTrack and call
+            // navigator.mediaDevices.getUserMedia directly so the browser
+            // can NOT override our constraints. With createLocalAudioTrack
+            // the LK SDK was sometimes silently turning NS/AGC back on,
+            // which made budget USB mics inaudible to Deepgram. Using the
+            // raw MediaStreamTrack gives us deterministic NS=off / AGC=off.
+            const constraints = {
+                audio: {
+                    deviceId: deviceId ? { exact: deviceId } : undefined,
+                    echoCancellation: { ideal: true },
+                    noiseSuppression: { exact: false },
+                    autoGainControl: { exact: false },
+                    channelCount: { ideal: 1 },
+                },
+                video: false,
+            };
+            log("Requesting mic with constraints: " + JSON.stringify(constraints.audio));
+            const stream = await navigator.mediaDevices.getUserMedia(constraints);
+            const rawTrack = stream.getAudioTracks()[0];
+            const settings = rawTrack.getSettings();
+            log(`Track settings: sampleRate=${settings.sampleRate} channels=${settings.channelCount} EC=${settings.echoCancellation} NS=${settings.noiseSuppression} AGC=${settings.autoGainControl}`);
+            if (settings.noiseSuppression === true || settings.autoGainControl === true) {
+                // Chrome/Edge sometimes ignore `{exact:false}` for WebRTC
+                // mic constraints and force NS/AGC on. Try applyConstraints
+                // as a second attempt, then warn (non-blocking) if it still
+                // fails. If Windows mic boost is configured properly STT
+                // still works — it's just sub-optimal.
+                try {
+                    await rawTrack.applyConstraints({
+                        noiseSuppression: false,
+                        autoGainControl: false,
+                        echoCancellation: true,
+                    });
+                    const s2 = rawTrack.getSettings();
+                    log(`After applyConstraints retry: NS=${s2.noiseSuppression} AGC=${s2.autoGainControl}`);
+                    if (s2.noiseSuppression === false && s2.autoGainControl === false) {
+                        log(`✅ NS/AGC now OFF after retry`);
+                    } else {
+                        log(`ℹ Browser still forcing NS/AGC. STT will still work if Windows mic boost is set; otherwise quiet speech may be lost.`);
+                    }
+                } catch (e) {
+                    log(`applyConstraints failed: ${e.message}`);
+                }
+            } else {
+                log(`✅ NS/AGC confirmed OFF — Deepgram will receive raw mic audio`);
+            }
+            // Wrap the raw track in a LocalAudioTrack so LiveKit publishes it.
+            localMicTrack = new LivekitClient.LocalAudioTrack(rawTrack);
+
+            await room.localParticipant.publishTrack(localMicTrack, {
+                source: LivekitClient.Track.Source.Microphone,
+            });
+            log("Mic published to LiveKit");
+
+            startLevelMeter(rawTrack);
+
+            setStatus('connected', 'Connected — bolo!');
+            disconnectBtn.disabled = false;
+        } catch (e) {
+            log("Error: " + e.message);
+            setStatus('', 'Error: ' + e.message);
+            connectBtn.disabled = false;
+        }
+    };
+
+    disconnectBtn.onclick = async () => {
+        try {
+            if (localMicTrack) { localMicTrack.stop(); localMicTrack = null; }
+            if (room) { await room.disconnect(); room = null; }
+        } catch (e) {
+            log("Disconnect error: " + e.message);
+        }
+    };
+</script>
+</body>
+</html>

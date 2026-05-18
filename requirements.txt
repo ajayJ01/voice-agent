@@ -1,0 +1,10 @@
+# Pin major line for reproducible deploys; bump after testing upgrades.
+livekit-agents>=1.5.6,<2.0.0
+livekit-plugins-deepgram>=1.5.6,<2.0.0
+livekit-plugins-openai>=1.5.6,<2.0.0
+livekit-plugins-cartesia>=1.5.6,<2.0.0
+livekit-plugins-silero>=1.5.6,<2.0.0
+python-dotenv>=1.0.0,<2.0.0
+livekit-api>=1.0.0,<2.0.0
+fastapi>=0.115.0,<1.0.0
+uvicorn[standard]>=0.30.0,<1.0.0

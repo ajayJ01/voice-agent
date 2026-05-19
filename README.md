@@ -35,7 +35,7 @@ For deeper notes on multilingual STT tradeoffs and optional architectures, see [
 ## Setup
 
 ```powershell
-cd "c:\path\to\New Ai Assistant"
+cd "c:\path\to\voice-agent"
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt

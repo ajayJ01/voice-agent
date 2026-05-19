@@ -2,7 +2,9 @@ import asyncio
 import logging
 import os
 import re
+from dataclasses import dataclass
 from pathlib import Path
+from collections.abc import AsyncIterable
 from typing import Any
 
 from dotenv import load_dotenv
@@ -236,6 +238,13 @@ _EN_TAG_HALLUCINATION_VOCAB = frozenset(
         "aló",
         "hola",
         "ola",
+        # Unaccented forms Nova-3 often emits on `en`-tagged junk lines.
+        "que",
+        "ordo",
+        "tene",
+        "utte",
+        "sexy",
+        "semaines",
     }
 )
 
@@ -252,7 +261,11 @@ def _looks_like_english_latin(text: str) -> bool:
     english_hits = sum(1 for w in words if w in _ENGLISH_STOPWORDS)
     if english_hits >= 2:
         return True
-    if english_hits >= 1 and len(words) <= 5:
+    # Single stopword in 4+ tokens is often Nova `multi` junk ("Do ordo que…"), not English.
+    if english_hits >= 1 and len(words) <= 3:
+        return True
+    _math_ok = {"plus", "minus", "times", "divided", "equals", "equal"}
+    if words and all(w.isdigit() or w in _math_ok for w in words):
         return True
     return False
 
@@ -397,12 +410,14 @@ def _is_en_tagged_noise(text: str) -> bool:
     words = [w for w in words if w]
     if not words:
         return True
-    if len(words) <= 5:
+    if len(words) <= 8:
         hits = sum(1 for w in words if w in _EN_TAG_HALLUCINATION_VOCAB)
-        if hits >= 1:
-            en_stop = sum(1 for w in words if w in _ENGLISH_STOPWORDS)
-            if en_stop <= hits:
-                return True
+        rom_hits = sum(1 for w in words if w in _HALLUCINATION_VOCAB)
+        en_stop = sum(1 for w in words if w in _ENGLISH_STOPWORDS)
+        if hits >= 1 and en_stop <= hits:
+            return True
+        if rom_hits >= 1 and not _looks_like_english_latin(t) and en_stop <= rom_hits:
+            return True
     return False
 
 
@@ -463,6 +478,7 @@ def _strip_spanish_artifacts(text: str) -> str:
         "deje", "menu", "ya", "señor", "señora", "já",
         # Short leaders Deepgram glues before Devanagari / next clause.
         "toma", "solo", "queda",
+        "entonces", "ora", "ahora",
     }
     if first_word in spanish_leaders:
         for i, ch in enumerate(cleaned):
@@ -736,7 +752,48 @@ def _merge_stt_display_chunks(acc: str, chunk: str) -> str:
         thr = max(8, int(0.35 * min(len(suf), len(b))))
         if best_cpl >= thr:
             return (a[:best_i] + b).strip()
-    return (a + " " + b).replace("  ", " ").strip()
+    # Unrelated phrases (Spanish junk → Hindi question) must not concatenate.
+    return b
+
+
+def _stt_chunk_is_refinement(prev: str, new: str) -> bool:
+    """True when ``new`` is a continuation/refinement of ``prev`` (same utterance)."""
+    a = (prev or "").strip()
+    b = (new or "").strip()
+    if not a or not b:
+        return True
+    if a in b or b in a:
+        return True
+    a_loose = a.rstrip(".,;:!? ")
+    b_loose = b.rstrip(".,;:!? ")
+    if b.startswith(a) or b.startswith(a_loose):
+        return True
+    if a.startswith(b) or a.startswith(b_loose):
+        return True
+    max_k = min(len(a), len(b))
+    for k in range(max_k, 2, -1):
+        if a.endswith(b[:k]):
+            return True
+    return False
+
+
+def _update_turn_stream_text(acc: str, chunk: str) -> str:
+    """Per-turn STT stream: refine in place, never glue unrelated phrases together."""
+    b = (chunk or "").strip()
+    if not b:
+        return (acc or "").strip()
+    a = (acc or "").strip()
+    if not a:
+        return b
+    if _stt_chunk_is_refinement(a, b):
+        return _merge_stt_display_chunks(a, b)
+    na = _normalize_commit_candidate(a) or a
+    nb = _normalize_commit_candidate(b) or b
+    if _commit_candidate_score(nb) >= _commit_candidate_score(na):
+        logger.info("STT_STREAM_REPLACE unrelated_prev=%r kept=%r", a[:80], b[:80])
+        return nb
+    logger.info("STT_STREAM_KEEP unrelated_new=%r kept=%r", b[:80], a[:80])
+    return na
 
 
 def _normalize_hinglish_stt_tokens(text: str) -> str:
@@ -926,27 +983,90 @@ def _dynamic_reply_language_rule(transcript: str, stt_lang: str | None) -> str:
     return " ".join(bits)
 
 
-def _mirroring_agent_drops_user_transcript(agent: Agent, transcript: str) -> bool:
+def _strip_user_lang_directive_prefix(text: str) -> str:
+    """Remove per-turn LLM directive lines we inject into the user ChatMessage."""
+    kept: list[str] = []
+    for ln in (text or "").splitlines():
+        s = ln.strip()
+        if s.startswith("[Reply in") and s.endswith("]"):
+            continue
+        kept.append(ln)
+    return "\n".join(kept).strip()
+
+
+def _isolate_latest_user_utterance(text: str) -> str:
+    """When LiveKit glues several user finals into one commit, keep only the latest."""
+    t = _strip_user_lang_directive_prefix(text)
+    if not t:
+        return t
+    # Stop each match at . or ! so "…I don't know. Which company…" → only the last ?-clause.
+    questions = [
+        m.group(0).strip()
+        for m in re.finditer(r"[^.!?\n]*\?", t, flags=re.UNICODE)
+    ]
+    if len(questions) >= 2:
+        latest = questions[-1]
+        logger.info(
+            "USER_TURN_ISOLATE_LATEST questions=%s before=%r after=%r",
+            len(questions),
+            t[:160],
+            latest,
+        )
+        return latest
+    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
+    if len(lines) >= 2:
+        latest = lines[-1]
+        if latest != t:
+            logger.info(
+                "USER_TURN_ISOLATE_LATEST lines=%s before=%r after=%r",
+                len(lines),
+                t[:160],
+                latest,
+            )
+        return latest
+    return t
+
+
+def _cartesia_tts_language(stt_lang: str | None, reply_preview: str = "") -> str:
+    """Cartesia sonic-3 language code from user turn (mirrors STT/LLM, not a fixed .env default)."""
+    default = (os.getenv("CARTESIA_LANGUAGE") or "hi").strip().lower() or "hi"
+    text = (reply_preview or "").strip()
+    if _devanagari_ratio(text) >= 0.08:
+        return "hi"
+    sl = (stt_lang or "").strip().lower()
+    base = sl.split("-", 1)[0] if sl else ""
+    if base == "en":
+        return "en"
+    if base == "hi":
+        return "hi"
+    if text and _looks_like_english_latin(text) and _devanagari_ratio(text) < 0.05:
+        return "en"
+    return default
+
+
+@dataclass
+class _PreparedUserTurn:
+    text: str
+    stt_lang: str | None
+    drop: bool = False
+    drop_reason: str = ""
+
+    def llm_user_input(self) -> str:
+        if self.drop or not self.text:
+            return ""
+        directive = _user_message_language_directive(self.text, self.stt_lang)
+        if directive:
+            return f"{directive}\n{self.text}"
+        return self.text
+
+
+def _mirroring_agent_drops_user_transcript(
+    agent: Agent, transcript: str, *, stt_lang: str | None = None
+) -> bool:
     """True iff MirroringLanguageAgent would raise StopResponse for this final transcript."""
     if not isinstance(agent, MirroringLanguageAgent):
         return False
-    text = _dedupe_repeated_stt_tail(
-        _normalize_hinglish_stt_tokens(_strip_stt_romance_leaks((transcript or "").strip()))
-    )
-    sl = agent._last_stt_language
-    if _should_drop_unsupported_stt_language(text, sl):
-        return True
-    if _is_hi_tagged_romance_latin_noise(text, sl):
-        return True
-    if _is_hallucinated_transcript(text, sl):
-        return True
-    if agent._recent_assistant_plain and _is_probably_assistant_echo(
-        text, agent._recent_assistant_plain
-    ):
-        return True
-    if sl and (sl == "en" or sl.startswith("en-")) and _is_en_tagged_noise(text):
-        return True
-    return False
+    return agent.prepare_user_transcript(transcript, stt_lang=stt_lang).drop
 
 
 class MirroringLanguageAgent(Agent):
@@ -1009,35 +1129,27 @@ class MirroringLanguageAgent(Agent):
     def reset_turn_language(self) -> None:
         self._last_stt_language = None
 
-    async def on_user_turn_completed(
-        self, turn_ctx: lk_llm.ChatContext, new_message: ChatMessage
-    ) -> None:
-        raw_text = (new_message.text_content or "").strip()
-        sl = self._last_stt_language
+    def prepare_user_transcript(
+        self,
+        raw_text: str,
+        *,
+        stt_lang: str | None = None,
+    ) -> _PreparedUserTurn:
+        """Shared STT cleanup + drop gates for natural turns and stuck recovery."""
+        sl = self._last_stt_language if stt_lang is None else stt_lang
+        raw = _isolate_latest_user_utterance((raw_text or "").strip())
 
-        # Strip Spanish-only punctuation/leader-word leaks before any other
-        # processing. This covers the case where lang=hi but a fake Spanish
-        # prefix was glued onto real Hindi content (e.g.
-        # "¿Qué ha tum sun रहे हो मुझे?" → "tum sun रहे हो मुझे?").
-        text = _strip_stt_romance_leaks(raw_text)
-        if text != raw_text:
+        text = _strip_stt_romance_leaks(raw)
+        if text != raw:
             logger.info(
                 "STRIPPED_STT_ROMANCE_LEAKS lang=%s before=%r after=%r",
-                sl, raw_text, text,
+                sl, raw, text,
             )
-            try:
-                new_message.content = [text]
-            except Exception:
-                pass
 
         hn = _normalize_hinglish_stt_tokens(text)
         if hn != text:
             logger.info("STT_HINGLISH_FIX lang=%s before=%r after=%r", sl, text, hn)
             text = hn
-            try:
-                new_message.content = [text]
-            except Exception:
-                pass
 
         alo_fix = _coerce_short_alo_transcript_to_hello(text)
         if alo_fix != text:
@@ -1050,142 +1162,89 @@ class MirroringLanguageAgent(Agent):
             text = alo_fix
             self._last_stt_language = "en"
             sl = "en"
-            try:
-                new_message.content = [text]
-            except Exception:
-                pass
 
         ded = _dedupe_repeated_stt_tail(text)
         if ded != text:
             logger.info("STT_DEDUPE_TAIL lang=%s before=%r after=%r", sl, text, ded)
             text = ded
-            try:
-                new_message.content = [text]
-            except Exception:
-                pass
+
+        sl = _infer_commit_stt_lang(text, sl)
+        if sl and sl != self._last_stt_language:
+            self._last_stt_language = sl
+
+        def _drop(reason: str, log_key: str) -> _PreparedUserTurn:
+            logger.warning(
+                "%s lang=%s chars=%s text=%r reason=%s",
+                log_key,
+                sl,
+                len(text),
+                text,
+                reason,
+            )
+            return _PreparedUserTurn(text=text, stt_lang=sl, drop=True, drop_reason=reason)
 
         if _should_drop_unsupported_stt_language(text, sl):
-            logger.warning(
-                "DROP_STT_LANG_POLICY lang=%s chars=%s text=%r reason=only_hi_en_supported",
-                sl, len(text), text,
-            )
-            try:
-                new_message.content = []
-            except Exception:
-                pass
-            try:
-                if turn_ctx.items and turn_ctx.items[-1] is new_message:
-                    turn_ctx.items.pop()
-            except Exception as e:
-                logger.debug("DROP_STT_LANG_HISTORY_TRIM_FAILED err=%r", e)
-            self._mark_stuck_watch_serviced_if_same_final(text)
-            raise StopResponse()
-
+            return _drop("only_hi_en_supported", "DROP_STT_LANG_POLICY")
         if _is_hi_tagged_romance_latin_noise(text, sl):
-            logger.warning(
-                "DROP_STT_LANG_POLICY lang=%s chars=%s text=%r reason=hi_tagged_romance_latin_noise",
-                sl, len(text), text,
-            )
-            try:
-                new_message.content = []
-            except Exception:
-                pass
-            try:
-                if turn_ctx.items and turn_ctx.items[-1] is new_message:
-                    turn_ctx.items.pop()
-            except Exception as e:
-                logger.debug("DROP_STT_LANG_HISTORY_TRIM_FAILED err=%r", e)
-            self._mark_stuck_watch_serviced_if_same_final(text)
-            raise StopResponse()
-
-        # Drop Spanish/Portuguese/French hallucinations from Deepgram `multi`
-        # mode on quiet audio. Without this filter the LLM tries to reply to
-        # gibberish like "¿Quién me tomará el nombre de un cierto?" and
-        # produces useless responses that pollute conversation history.
+            return _drop("hi_tagged_romance_latin_noise", "DROP_STT_LANG_POLICY")
         if _is_hallucinated_transcript(text, sl):
-            logger.warning(
-                "DROP_HALLUCINATION lang=%s chars=%s text=%r reason=non_supported_language_no_devanagari_no_english",
-                sl, len(text), text,
+            return _drop(
+                "non_supported_language_no_devanagari_no_english",
+                "DROP_HALLUCINATION",
             )
-            # Belt-and-suspenders cleanup: blank the user message AND remove
-            # it from the turn context, so even if StopResponse isn't honored
-            # by the framework version, the LLM sees an empty user turn
-            # instead of Spanish gibberish on subsequent turns.
-            try:
-                new_message.content = []
-            except Exception:
-                pass
-            try:
-                if turn_ctx.items and turn_ctx.items[-1] is new_message:
-                    turn_ctx.items.pop()
-            except Exception as e:
-                logger.debug("HALLUCINATION_HISTORY_TRIM_FAILED err=%r", e)
-            self._mark_stuck_watch_serviced_if_same_final(text)
-            raise StopResponse()
-
         if self._recent_assistant_plain and _is_probably_assistant_echo(
             text, self._recent_assistant_plain
         ):
-            logger.warning(
-                "DROP_HALLUCINATION lang=%s chars=%s text=%r reason=tts_or_room_echo_overlap",
-                sl, len(text), text,
-            )
-            try:
-                new_message.content = []
-            except Exception:
-                pass
-            try:
-                if turn_ctx.items and turn_ctx.items[-1] is new_message:
-                    turn_ctx.items.pop()
-            except Exception as e:
-                logger.debug("HALLUCINATION_HISTORY_TRIM_FAILED err=%r", e)
-            self._mark_stuck_watch_serviced_if_same_final(text)
-            raise StopResponse()
+            return _drop("tts_or_room_echo_overlap", "DROP_HALLUCINATION")
+        sl_base = (sl or "").split("-", 1)[0]
+        if (sl_base == "en" or not sl) and _is_en_tagged_noise(text):
+            return _drop("en_tagged_multimodel_noise", "DROP_HALLUCINATION")
 
-        if sl and (sl == "en" or sl.startswith("en-")) and _is_en_tagged_noise(text):
-            logger.warning(
-                "DROP_HALLUCINATION lang=%s chars=%s text=%r reason=en_tagged_multimodel_noise",
-                sl, len(text), text,
-            )
-            try:
-                new_message.content = []
-            except Exception:
-                pass
-            try:
-                if turn_ctx.items and turn_ctx.items[-1] is new_message:
-                    turn_ctx.items.pop()
-            except Exception as e:
-                logger.debug("HALLUCINATION_HISTORY_TRIM_FAILED err=%r", e)
-            self._mark_stuck_watch_serviced_if_same_final(text)
-            raise StopResponse()
+        return _PreparedUserTurn(text=text, stt_lang=sl, drop=False)
 
-        rule = _dynamic_reply_language_rule(text, sl)
+    async def apply_mirror_instructions(self, prepared: _PreparedUserTurn) -> None:
+        """Per-turn language rule (same as on_user_turn_completed, for stuck recovery)."""
+        rule = _dynamic_reply_language_rule(prepared.text, prepared.stt_lang)
         try:
-            # Put the per-turn language rule FIRST. LLMs attend more strongly
-            # to the top of the system prompt; with the rule at the bottom,
-            # llama-3.1-8b ignored it ~30% of the time on short inputs like
-            # "Hello" (replied "Namaste!" instead of "Hi!").
             await self.update_instructions(f"{rule}\n\n{self._base_instructions}")
-            logger.info("MIRROR_LANG updated instructions stt_lang=%s", sl)
+            logger.info("MIRROR_LANG updated instructions stt_lang=%s", prepared.stt_lang)
         except Exception as exc:
             logger.error("MIRROR_LANG_INSTRUCTIONS_FAILED error=%r", exc)
 
-        # Belt-and-suspenders: also inject a tiny language directive INTO the
-        # user message itself. System-prompt rules alone aren't enough on
-        # llama-3.3-70b for creative prompts ("Tell me a story") when the
-        # conversation history is in another language — the model defaults to
-        # the history's language no matter what the system prompt says.
-        # Prefixing the user message with a one-line directive gives the
-        # model an instruction it can't ignore (it's part of the very text
-        # it's reacting to).
-        directive = _user_message_language_directive(text, sl)
-        if directive:
-            decorated = f"{directive}\n{text}"
+    async def on_user_turn_completed(
+        self, turn_ctx: lk_llm.ChatContext, new_message: ChatMessage
+    ) -> None:
+        raw_text = (new_message.text_content or "").strip()
+        prepared = self.prepare_user_transcript(raw_text)
+
+        if prepared.drop:
             try:
-                new_message.content = [decorated]
+                new_message.content = []
+            except Exception:
+                pass
+            try:
+                if turn_ctx.items and turn_ctx.items[-1] is new_message:
+                    turn_ctx.items.pop()
+            except Exception as e:
+                logger.debug("DROP_STT_HISTORY_TRIM_FAILED err=%r reason=%s", e, prepared.drop_reason)
+            self._mark_stuck_watch_serviced_if_same_final(prepared.text)
+            raise StopResponse()
+
+        try:
+            new_message.content = [prepared.text]
+        except Exception:
+            pass
+
+        await self.apply_mirror_instructions(prepared)
+
+        llm_input = prepared.llm_user_input()
+        if llm_input != prepared.text:
+            try:
+                new_message.content = [llm_input]
                 logger.info(
                     "INJECTED_USER_LANG_DIRECTIVE stt_lang=%s directive=%r",
-                    sl, directive,
+                    prepared.stt_lang,
+                    _user_message_language_directive(prepared.text, prepared.stt_lang),
                 )
             except Exception as e:
                 logger.debug("INJECT_USER_DIRECTIVE_FAILED err=%r", e)
@@ -1196,6 +1255,31 @@ class MirroringLanguageAgent(Agent):
             raise
         except Exception as e:
             logger.error("SUPER_CALL_FAILED in on_user_turn_completed: %s", e)
+            return
+
+        # Natural turn committed — do not fire stuck-pipeline generate_reply() again.
+        self._mark_stuck_watch_serviced_if_same_final(prepared.text)
+
+    async def tts_node(
+        self, text: AsyncIterable[str], model_settings: Any
+    ) -> AsyncIterable[Any]:
+        """Set Cartesia language per user turn before synthesis (en vs hi)."""
+        activity = self._get_activity_or_raise()
+        engine = activity.tts
+        cartesia_lang = _cartesia_tts_language(self._last_stt_language)
+        if engine is not None and hasattr(engine, "update_options"):
+            try:
+                engine.update_options(language=cartesia_lang)
+                logger.info(
+                    "TTS_LANG_MIRROR stt_lang=%s cartesia_lang=%s",
+                    self._last_stt_language,
+                    cartesia_lang,
+                )
+            except Exception as exc:
+                logger.warning("TTS_LANG_MIRROR_FAILED error=%r", exc)
+
+        async for frame in Agent.default.tts_node(self, text, model_settings):
+            yield frame
 
 
 def _is_usable_transcript(text: str) -> bool:
@@ -1233,6 +1317,111 @@ def _is_usable_transcript(text: str) -> bool:
     if dev_chars >= 2:
         return True
     return False
+
+
+_COMMIT_LATIN_LEADERS = frozenset(
+    {
+        "entonces",
+        "ora",
+        "ahora",
+        "toma",
+        "solo",
+        "queda",
+        "vamos",
+        "deje",
+        "perdon",
+        "perdón",
+        "hola",
+        "que",
+        "qué",
+        "ya",
+    }
+)
+
+
+def _normalize_commit_candidate(raw: str) -> str:
+    """Clean one STT candidate for turn commit (stricter than display merge)."""
+    t = _dedupe_repeated_stt_tail(
+        _normalize_hinglish_stt_tokens(_strip_stt_romance_leaks((raw or "").strip()))
+    )
+    if not t:
+        return ""
+    for i, ch in enumerate(t):
+        if "\u0900" <= ch <= "\u097F":
+            prefix = t[:i].strip(" .,;:")
+            if prefix and _devanagari_ratio(t[i:]) >= _STT_DEVANAGARI_HI_SIGNAL:
+                drop = False
+                if _latin_prefix_is_pt_es_noise(prefix):
+                    drop = True
+                elif not _looks_like_english_latin(prefix):
+                    fw = (
+                        prefix.split(maxsplit=1)[0].lower().strip(".,?!¿¡;:'\"")
+                        if prefix.split()
+                        else ""
+                    )
+                    if fw in _COMMIT_LATIN_LEADERS or _is_embedded_romance_noise_clause(prefix):
+                        drop = True
+                    elif any(c in _EU_ACCENT_CHARS for c in prefix):
+                        drop = True
+                if drop:
+                    tail = t[i:].lstrip()
+                    if tail:
+                        logger.info(
+                            "COMMIT_STRIP_LATIN_PREFIX before=%r after=%r",
+                            t[:100],
+                            tail[:100],
+                        )
+                        return tail
+            break
+    if _devanagari_ratio(t) < 0.05 and not _looks_like_english_latin(t):
+        if _whole_line_is_pt_es_multi_noise(t) or _is_en_tagged_noise(t):
+            return ""
+    return t
+
+
+def _commit_candidate_score(text: str) -> tuple[int, int, int]:
+    """Rank candidates: usable > Devanagari mass > length (not raw length alone)."""
+    if not text or not _is_usable_transcript(text):
+        return (0, 0, 0)
+    dev = sum(1 for c in text if "\u0900" <= c <= "\u097f")
+    penalty = 0
+    low = text.lower()
+    if dev >= 2 and any(
+        frag in low for frag in ("entonces", "ora toca", "predairement", "con la", "qué tiene")
+    ):
+        penalty = 80
+    return (1, max(0, dev - penalty), len(text))
+
+
+def _pick_best_stt_commit_text(*candidates: str) -> str:
+    """Best transcript for LLM commit from this turn's STT buffers only."""
+    best = ""
+    best_score = (0, 0, 0)
+    for raw in candidates:
+        t = _normalize_commit_candidate(raw)
+        if not t:
+            continue
+        score = _commit_candidate_score(t)
+        if score > best_score:
+            best_score = score
+            best = t
+    return best
+
+
+def _infer_commit_stt_lang(text: str, tagged: str | None) -> str | None:
+    """Prefer script over a stale Deepgram tag (e.g. hi text tagged es)."""
+    t = (text or "").strip()
+    if not t:
+        return tagged
+    dev = _devanagari_ratio(t)
+    if dev >= 0.12:
+        return "hi"
+    if dev < 0.05 and _looks_like_english_latin(t):
+        return "en"
+    sl = (tagged or "").strip().lower()
+    if sl and sl.split("-", 1)[0] in _SUPPORTED_LANGS:
+        return sl.split("-", 1)[0]
+    return tagged
 
 
 def _normalize_deepgram_language(language: str) -> str:
@@ -1340,6 +1529,14 @@ def _build_agent(
     )
     if "राष्ट्रपति" not in instructions and "president of india" not in instructions.lower():
         instructions = instructions.rstrip() + _in_gov_roles
+    _nyra_identity = (
+        " Identity: you are Nyra, a Hinglish voice assistant in this demo. "
+        "You are NOT Meta AI, ChatGPT, Gemini, or owned by Elon Musk. "
+        "If asked who made or owns you, say you were built by your developers for this "
+        "voice assistant — never claim to be part of Meta or any other big-tech product."
+    )
+    if "meta ai" not in instructions.lower() and "you are nyra" not in instructions.lower():
+        instructions = instructions.rstrip() + _nyra_identity
 
     if pipeline in ["stt_llm", "stt_llm_tts"]:
         provider = _resolve_llm_provider()
@@ -1348,24 +1545,28 @@ def _build_agent(
         else:
             resolved_pipeline = "stt_only"
 
-    # === FINAL FIXED CARTESIA TTS ===
     if pipeline == "stt_llm_tts" and cartesia:
         try:
-            tts = cartesia.TTS(
-                model="sonic-3",                                      # ← yeh zaroori hai
-                voice=_required_env("CARTESIA_VOICE_ID"),             # .env se exact voice ID
-                language=os.getenv("CARTESIA_LANGUAGE", "hi"),        # ← Hindi ke liye
-                # speed float bhi support karta hai (optional)
-            )
-
-            logger.info("TTS_FINAL_CONFIG model=sonic-3 language=%s voice=%s",
+            tts_kwargs: dict[str, Any] = {
+                "model": "sonic-3",
+                "voice": _required_env("CARTESIA_VOICE_ID"),
+                "language": os.getenv("CARTESIA_LANGUAGE", "hi"),
+                # sonic-3 + hi: word timestamps only work for en/de/es/fr — disable for Hindi.
+                "word_timestamps": False,
+            }
+            tts_speed_raw = (os.getenv("TTS_SPEED") or "").strip()
+            if tts_speed_raw:
+                tts_kwargs["speed"] = float(tts_speed_raw)
+            tts = cartesia.TTS(**tts_kwargs)
+            logger.info(
+                "TTS_CONFIG model=sonic-3 default_language=%s voice=%s "
+                "word_timestamps=false per_turn_lang_mirror=true",
                 os.getenv("CARTESIA_LANGUAGE", "hi"),
-                os.getenv("CARTESIA_VOICE_ID"))
-            
+                os.getenv("CARTESIA_VOICE_ID"),
+            )
         except Exception as e:
             logger.error("TTS_INIT_FAILED error=%s → tts=disabled", e)
             tts = None
-    # =====================
 
     logger.info(
         "VOICE_AGENT_CONFIG pipeline=%s stt_quality_mode=%s stt=deepgram model=%s language=%s "
@@ -1524,9 +1725,11 @@ async def entrypoint(ctx: JobContext) -> None:
     last_user_final: dict[str, Any] = {
         "turn": 0,
         "text": "",
+        "lang": None,
         "ts": 0.0,
         "serviced": True,
     }
+    recovery_inflight: dict[str, int | None] = {"turn": None}
     agent, pipeline = _build_agent(
         pipeline=requested_pipeline, stuck_watch_ref=last_user_final
     )
@@ -1875,6 +2078,36 @@ async def entrypoint(ctx: JobContext) -> None:
                     turn_id, speech_ms, turn["interims"], turn["finals"],
                     last_interim_transcript["text"],
                 )
+                # Nova often keeps a good Hindi/English line in interims but never
+                # emits STT_FINAL after VAD closes — arm the same stuck watchdog.
+                interim_best = _pick_best_stt_commit_text(
+                    last_interim_transcript["text"],
+                    stt_longest_stream_text["text"],
+                )
+                if (
+                    interim_best
+                    and pipeline != "stt_only"
+                    and not _mirroring_agent_drops_user_transcript(agent, interim_best)
+                ):
+                    last_user_final["turn"] = turn_id
+                    last_user_final["text"] = interim_best
+                    last_user_final["lang"] = (
+                        agent._last_stt_language
+                        if isinstance(agent, MirroringLanguageAgent)
+                        else None
+                    )
+                    last_user_final["ts"] = asyncio.get_event_loop().time()
+                    last_user_final["serviced"] = False
+                    logger.info(
+                        "STT_INTERIM_ONLY_RECOVERY turn=%s text=%r",
+                        turn_id,
+                        interim_best,
+                    )
+                    _track_watch_task(
+                        asyncio.create_task(
+                            _kick_stuck_pipeline(turn_id, interim_best)
+                        )
+                    )
 
     async def _warn_if_no_user_state_seen() -> None:
         # Grace period after session start so mic publish / first VAD do not trip a false warning.
@@ -2068,7 +2301,45 @@ async def entrypoint(ctx: JobContext) -> None:
             )
             last_user_final["serviced"] = True
             return
-        if _mirroring_agent_drops_user_transcript(agent, stuck_text):
+        if recovery_inflight["turn"] == stuck_turn_id:
+            return
+        resolved = _pick_best_stt_commit_text(
+            stuck_text,
+            stt_longest_stream_text["text"],
+            stt_longest_final_text["text"],
+            stt_latest_final_text["text"],
+            last_interim_transcript["text"],
+        )
+        if resolved and resolved != stuck_text:
+            logger.info(
+                "STUCK_PIPELINE_USE_LONGER_TEXT turn=%s before=%r after=%r",
+                stuck_turn_id,
+                stuck_text,
+                resolved,
+            )
+            stuck_text = resolved
+        if not stuck_text:
+            last_user_final["serviced"] = True
+            return
+        stt_lang = _infer_commit_stt_lang(
+            stuck_text, last_user_final.get("lang")
+        )
+        prepared_turn: _PreparedUserTurn | None = None
+        if isinstance(agent, MirroringLanguageAgent):
+            prepared_turn = agent.prepare_user_transcript(stuck_text, stt_lang=stt_lang)
+            if prepared_turn.drop:
+                logger.warning(
+                    "STUCK_PIPELINE_RECOVERY_SKIPPED turn=%s text=%r "
+                    "reason=transcript_would_be_dropped_by_hallucination_gate drop=%s",
+                    stuck_turn_id,
+                    stuck_text,
+                    prepared_turn.drop_reason,
+                )
+                last_user_final["serviced"] = True
+                return
+            stuck_text = prepared_turn.text
+            stt_lang = prepared_turn.stt_lang
+        elif _mirroring_agent_drops_user_transcript(agent, stuck_text, stt_lang=stt_lang):
             logger.warning(
                 "STUCK_PIPELINE_RECOVERY_SKIPPED turn=%s text=%r "
                 "reason=transcript_would_be_dropped_by_hallucination_gate",
@@ -2090,11 +2361,24 @@ async def entrypoint(ctx: JobContext) -> None:
             stuck_turn_id, stuck_text,
         )
         try:
+            recovery_inflight["turn"] = stuck_turn_id
             last_user_final["serviced"] = True
-            session.generate_reply(user_input=stuck_text)
+            llm_input = stuck_text
+            if prepared_turn is not None:
+                await agent.apply_mirror_instructions(prepared_turn)
+                llm_input = prepared_turn.llm_user_input()
+                logger.info(
+                    "STUCK_PIPELINE_MIRROR_APPLIED turn=%s stt_lang=%s chars=%s",
+                    stuck_turn_id,
+                    prepared_turn.stt_lang,
+                    len(llm_input),
+                )
+            # Do not let late STT fragments (e.g. "Hey." after "Hello…") cancel this reply.
+            session.generate_reply(user_input=llm_input, allow_interruptions=False)
         except Exception as exc:
             logger.error("STUCK_PIPELINE_RECOVERY_FAILED err=%r", exc)
             last_user_final["serviced"] = False
+            recovery_inflight["turn"] = None
 
     @session.on("user_input_transcribed")
     def _on_user_input_transcribed(ev) -> None:
@@ -2120,7 +2404,7 @@ async def entrypoint(ctx: JobContext) -> None:
         stt_last_activity_ts["t"] = now
         last_any_transcript_ts["t"] = now
         if transcript:
-            stt_longest_stream_text["text"] = _merge_stt_display_chunks(
+            stt_longest_stream_text["text"] = _update_turn_stream_text(
                 stt_longest_stream_text["text"], transcript
             )
 
@@ -2197,15 +2481,48 @@ async def entrypoint(ctx: JobContext) -> None:
             # on_user_turn_completed path. Only if nothing commits does it
             # call generate_reply() (true wedged state).
             if _is_usable_transcript(transcript) and pipeline != "stt_only":
-                last_user_final["turn"] = turn["id"]
-                last_user_final["text"] = transcript
-                last_user_final["ts"] = now
-                last_user_final["serviced"] = False
-                _track_watch_task(
-                    asyncio.create_task(
-                        _kick_stuck_pipeline(turn["id"], transcript)
-                    )
+                commit_text = _pick_best_stt_commit_text(
+                    transcript,
+                    stt_longest_stream_text["text"],
+                    stt_longest_final_text["text"],
                 )
+                if not commit_text:
+                    commit_text = _normalize_commit_candidate(transcript) or transcript
+                commit_lang = _infer_commit_stt_lang(
+                    commit_text,
+                    str(language) if language is not None else None,
+                )
+                prev_turn = last_user_final.get("turn")
+                prev_text = last_user_final.get("text", "")
+                prev_score = _commit_candidate_score(
+                    _normalize_commit_candidate(prev_text)
+                )
+                new_score = _commit_candidate_score(commit_text)
+                rearm = (
+                    prev_turn != turn["id"]
+                    or new_score > prev_score
+                    or not last_user_final.get("serviced", True)
+                )
+                if recovery_inflight["turn"] == turn["id"]:
+                    logger.info(
+                        "STT_FINAL_SKIP_REARM turn=%s text=%r reason=recovery_inflight",
+                        turn["id"],
+                        transcript[:80],
+                    )
+                    rearm = False
+                if rearm:
+                    last_user_final["turn"] = turn["id"]
+                    last_user_final["text"] = commit_text
+                    last_user_final["lang"] = commit_lang
+                    last_user_final["ts"] = now
+                    last_user_final["serviced"] = False
+                    if recovery_inflight["turn"] != turn["id"]:
+                        recovery_inflight["turn"] = None
+                    _track_watch_task(
+                        asyncio.create_task(
+                            _kick_stuck_pipeline(turn["id"], commit_text)
+                        )
+                    )
 
             if stop_after_first_final:
                 asyncio.create_task(_stop_after_first_final(transcript))
@@ -2231,7 +2548,7 @@ async def entrypoint(ctx: JobContext) -> None:
             and role == "user"
             and isinstance(agent, MirroringLanguageAgent)
         ):
-            raw_ut = (item.text_content or "").strip()
+            raw_ut = _isolate_latest_user_utterance((item.text_content or "").strip())
             ut = _dedupe_repeated_stt_tail(
                 _normalize_hinglish_stt_tokens(_strip_stt_romance_leaks(raw_ut))
             )
@@ -2312,6 +2629,7 @@ async def entrypoint(ctx: JobContext) -> None:
                 md = {}
             if role == "user":
                 last_user_final["serviced"] = True
+                recovery_inflight["turn"] = None
                 utext = (item.text_content or "").strip()
                 preview = (utext[:100] + "…") if len(utext) > 100 else utext
                 td_coalesced = md.get("transcription_delay")
@@ -2360,6 +2678,7 @@ async def entrypoint(ctx: JobContext) -> None:
                         preview,
                     )
             elif role == "assistant":
+                recovery_inflight["turn"] = None
                 now_item = asyncio.get_event_loop().time()
                 t0 = agent_phase_ts.get("thinking") or 0.0
                 think_to_commit_ms = int((now_item - t0) * 1000) if t0 else -1

@@ -156,6 +156,16 @@
     let userFinalMergeAcc = '';
     let wasLocalSpeaking = false;
 
+    function isLocalFinalRefinement(prev, next) {
+        const a = (prev || '').trim();
+        const b = (next || '').trim();
+        if (!a || !b) return true;
+        if (b.includes(a) || a.includes(b)) return true;
+        const aLoose = a.replace(/[.,;:!?]+$/g, '');
+        if (b.startsWith(a) || b.startsWith(aLoose)) return true;
+        return false;
+    }
+
     function mergeLocalUserFinals(prev, next) {
         const a = (prev || '').trim();
         const b = (next || '').trim();
@@ -163,7 +173,11 @@
         if (!b) return a;
         if (b.includes(a)) return b;
         if (a.includes(b)) return a;
-        return (a + ' ' + b).replace(/\s+/g, ' ').trim();
+        if (isLocalFinalRefinement(a, b)) {
+            return b.length >= a.length ? b : a;
+        }
+        // New phrase in the same LiveKit turn — do not stack session history in the UI.
+        return b;
     }
 
     /** Keep in sync with agent.py multi-model romance-glue stripping (display only). */
@@ -391,6 +405,9 @@
             if (localSpeaking && !wasLocalSpeaking) {
                 userFinalMergeAcc = '';
                 transcriptFinal.textContent = '';
+                transcriptInterim.textContent = '';
+            } else if (!localSpeaking && wasLocalSpeaking) {
+                userFinalMergeAcc = '';
             }
             wasLocalSpeaking = localSpeaking;
             if (remoteSpeaking) setStatus('agent-speaking', 'Agent speaking...');
@@ -448,13 +465,13 @@
             // can NOT override our constraints. With createLocalAudioTrack
             // the LK SDK was sometimes silently turning NS/AGC back on,
             // which made budget USB mics inaudible to Deepgram. Using the
-            // raw MediaStreamTrack gives us deterministic NS=off / AGC=off.
+            // NS off for Deepgram; AGC on helps quiet mics (Windows level still matters).
             const constraints = {
                 audio: {
                     deviceId: deviceId ? { exact: deviceId } : undefined,
                     echoCancellation: { ideal: true },
                     noiseSuppression: { exact: false },
-                    autoGainControl: { exact: false },
+                    autoGainControl: { ideal: true },
                     channelCount: { ideal: 1 },
                 },
                 video: false,
@@ -464,31 +481,22 @@
             const rawTrack = stream.getAudioTracks()[0];
             const settings = rawTrack.getSettings();
             log(`Track settings: sampleRate=${settings.sampleRate} channels=${settings.channelCount} EC=${settings.echoCancellation} NS=${settings.noiseSuppression} AGC=${settings.autoGainControl}`);
-            if (settings.noiseSuppression === true || settings.autoGainControl === true) {
-                // Chrome/Edge sometimes ignore `{exact:false}` for WebRTC
-                // mic constraints and force NS/AGC on. Try applyConstraints
-                // as a second attempt, then warn (non-blocking) if it still
-                // fails. If Windows mic boost is configured properly STT
-                // still works — it's just sub-optimal.
+            if (settings.noiseSuppression === true) {
                 try {
                     await rawTrack.applyConstraints({
                         noiseSuppression: false,
-                        autoGainControl: false,
                         echoCancellation: true,
                     });
                     const s2 = rawTrack.getSettings();
                     log(`After applyConstraints retry: NS=${s2.noiseSuppression} AGC=${s2.autoGainControl}`);
-                    if (s2.noiseSuppression === false && s2.autoGainControl === false) {
-                        log(`✅ NS/AGC now OFF after retry`);
-                    } else {
-                        log(`ℹ Browser still forcing NS/AGC. STT will still work if Windows mic boost is set; otherwise quiet speech may be lost.`);
-                    }
                 } catch (e) {
                     log(`applyConstraints failed: ${e.message}`);
                 }
-            } else {
-                log(`✅ NS/AGC confirmed OFF — Deepgram will receive raw mic audio`);
             }
+            log(
+                `✅ Mic track: NS=${rawTrack.getSettings().noiseSuppression} AGC=${rawTrack.getSettings().autoGainControl} ` +
+                `(AGC boosts quiet speech; keep Windows input level ≥80%)`
+            );
             // Wrap the raw track in a LocalAudioTrack so LiveKit publishes it.
             localMicTrack = new LivekitClient.LocalAudioTrack(rawTrack);
 

@@ -122,7 +122,7 @@ Full variable list and defaults live in **`.env.example`**.
 | Token server 500 in production | Set `TOKEN_SERVER_CORS_ORIGINS` to real browser origins (no `*` with credentials). |
 | Empty or garbage STT | Mic level in UI (green/yellow); Windows “Communications” device lowers gain—use a normal mic device; see help panel in `index.html`. |
 | `stt_llm` but no LLM replies | Missing `GROQ_API_KEY` / `OPENAI_API_KEY`; check logs for pipeline fallback to `stt_only`. |
-| No speech from agent | `VOICE_PIPELINE=stt_llm_tts`, `CARTESIA_API_KEY`, `CARTESIA_VOICE_ID`, and Cartesia package installed; check `TTS_INIT_FAILED` in logs. |
+| No speech from agent | `VOICE_PIPELINE=stt_llm_tts`, `CARTESIA_API_KEY`, `CARTESIA_VOICE_ID`, and Cartesia package installed; check `TTS_INIT_FAILED` in logs. Look for `TTS_LANG_MIRROR` (per-turn `en`/`hi`). Log `no audio frames were pushed` often means Cartesia returned no audio — check [Cartesia credits/subscription](https://play.cartesia.ai/subscription) (HTTP 402) and that the voice supports the reply language. |
 | Duplicate user messages / stuck turn | Code includes **stuck-pipeline recovery** and STT idle guards (`STUCK_PIPELINE_*`, `STT_RECOVERY_*`); tune only after reading log patterns. |
 
 ## Security

@@ -1,0 +1,11 @@
+﻿OK 'Hello?' -> chat ['greeting']
+OK 'αñàαñ░αÑç αñ«αÑêαñé αñ¬αÑüαñ¢ αñ░αñ╣αñ╛ αñ╣αÑéαñé αññαÑüαñ« αñòαÑêαñ╕αÑÇ αñ╣αÑï?' -> chat ['how_are_you']
+OK 'αñ«αÑêαñéαñ¿αÑç last question αñòαñ┐αñ»αñ╛ αñ¬αÑüαñ¢αñ╛ αñÑαñ╛.' -> chat ['conversation_recall']
+FAIL 'αñ«αÑçαñ░αñ╛ αñåαñûαñ┐αñ░αÑÇ αñòαÑÇαñ░αÑìαñ╖αñú αñòαÑìαñ»αñ╛ αñÑαñ╛ αññαÑüαñ«αñ╕αÑç?' -> ambiguous []
+OK 'αññαÑï αñ½αñ┐αñ░ αñ¼αññαñ╛αñô αñ¿ αñ¡αñ╛αñ░αññ αñòαñ╛ αñ¬αÑìαñ░αñºαñ╛αñ¿αñ«αñéαññαÑìαñ░αÑÇ αñòαÑîαñ¿ αñ╣' -> current_affairs ['role_pm']
+OK '2+2 kitna hai' -> static_knowledge ['math']
+OK 'France ki capital kya hai' -> static_knowledge ['capital']
+OK 'aaj ka mausam kaisa hai' -> current_affairs ['temporal_now', 'weather_today']
+OK 'thank you' -> chat ['thanks']
+AMB 'bharat ke bare me batao' -> ambiguous []
+rules: 8 / 9

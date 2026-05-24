@@ -96,39 +96,6 @@ def _env_choice(name: str, allowed: set[str], default: str) -> str:
     return raw
 
 
-def _chat_history_max_messages() -> int:
-    """Max user/assistant messages kept for LLM context (0 = unlimited)."""
-    return max(0, _env_int("CHAT_HISTORY_MAX_MESSAGES", 10))
-
-
-def _trim_chat_history(
-    chat_ctx: lk_llm.ChatContext,
-    *,
-    max_messages: int,
-    reserve_incoming: int = 0,
-) -> int:
-    """Drop oldest user/assistant messages; keep system/developer and other items."""
-    if max_messages <= 0:
-        return 0
-    limit = max(0, max_messages - max(0, reserve_incoming))
-    items = list(chat_ctx.items)
-    conv_idxs = [
-        i
-        for i, item in enumerate(items)
-        if isinstance(item, ChatMessage) and item.role in ("user", "assistant")
-    ]
-    if limit <= 0:
-        drop_idxs = set(conv_idxs)
-    elif len(conv_idxs) <= limit:
-        return 0
-    else:
-        drop_idxs = set(conv_idxs[: len(conv_idxs) - limit])
-    if not drop_idxs:
-        return 0
-    chat_ctx.items = [it for i, it in enumerate(items) if i not in drop_idxs]
-    return len(drop_idxs)
-
-
 def _stt_quality_preset() -> tuple[str, dict[str, float | int]]:
     """Single knob: latency ↔ accuracy for Hindi+English streaming STT.
 
@@ -937,12 +904,7 @@ def _user_message_language_directive(transcript: str, stt_lang: str | None) -> s
                 "(e.g. plus, Intelligence); do not add extra English.]"
             )
         return "[Reply in Devanagari Hindi only — no English/Roman letters.]"
-    if base_lang == "en" or _is_farewell_utterance(t):
-        if _is_farewell_utterance(t):
-            return (
-                "[Reply in pure English only — one brief goodbye, e.g. "
-                "\"Goodbye!\" or \"Take care!\" — no Hindi, no location facts.]"
-            )
+    if base_lang == "en":
         return "[Reply in pure English only — no Hindi, no Devanagari.]"
     if base_lang == "hi" and dev_ratio < 0.05:
         return "[Reply in Roman Hinglish only — no Devanagari.]"
@@ -959,14 +921,6 @@ def _dynamic_reply_language_rule(transcript: str, stt_lang: str | None) -> str:
     bits.append("=== STRICT REPLY RULE FOR THIS TURN (override anything in the system prompt) ===")
     if sl:
         bits.append(f'STT language tag: "{sl}".')
-
-    if _is_farewell_utterance(t):
-        bits.append(
-            "User said goodbye. Reply with ONE very short English farewell only "
-            '(e.g. "Goodbye!" or "Take care!"). NO Hindi. NO location, technology, or identity facts.'
-        )
-        bits.append("Keep the reply short (one sentence) and natural like a friend.")
-        return " ".join(bits)
 
     if dev_ratio > 0.12:
         if _transcript_has_obvious_roman_loanwords(t):
@@ -1040,64 +994,11 @@ def _strip_user_lang_directive_prefix(text: str) -> str:
     return "\n".join(kept).strip()
 
 
-_FAREWELL_PHRASES = frozenset(
-    {
-        "bye",
-        "goodbye",
-        "good bye",
-        "see you",
-        "ok bye",
-        "okay bye",
-        "alvida",
-        "alvidā",
-    }
-)
-
-
-def _is_farewell_utterance(text: str) -> bool:
-    """Short English sign-offs (often glued after a prior Hindi question in one commit)."""
-    t = (text or "").strip().rstrip(".!?…")
-    if not t:
-        return False
-    low = t.lower()
-    if low in _FAREWELL_PHRASES:
-        return True
-    if low.startswith("goodbye") and len(low) <= 12:
-        return True
-    return bool(re.fullmatch(r"(?:good\s*bye|bye|ok(?:ay)?\s+bye)(?:\s+bye)?", low))
-
-
 def _isolate_latest_user_utterance(text: str) -> str:
     """When LiveKit glues several user finals into one commit, keep only the latest."""
     t = _strip_user_lang_directive_prefix(text)
     if not t:
         return t
-    # "…तुम? Goodbye." / "…? See you." — honour the latest English sign-off, not the old Hindi Q.
-    if "?" in t:
-        tail = t.split("?")[-1].strip()
-        if tail and (
-            _is_farewell_utterance(tail)
-            or (
-                _looks_like_english_latin(tail)
-                and len(tail.split()) <= 4
-                and _devanagari_ratio(tail) < 0.05
-            )
-        ):
-            logger.info(
-                "USER_TURN_ISOLATE_AFTER_QUESTION before=%r after=%r",
-                t[:160],
-                tail,
-            )
-            return tail
-    segments = [s.strip() for s in re.split(r"(?<=[.!?।])\s+", t.strip()) if s.strip()]
-    if len(segments) >= 2 and _is_farewell_utterance(segments[-1]):
-        logger.info(
-            "USER_TURN_ISOLATE_FAREWELL segments=%s before=%r after=%r",
-            len(segments),
-            t[:160],
-            segments[-1],
-        )
-        return segments[-1]
     # Stop each match at . or ! so "…I don't know. Which company…" → only the last ?-clause.
     questions = [
         m.group(0).strip()
@@ -1310,42 +1211,6 @@ class MirroringLanguageAgent(Agent):
         except Exception as exc:
             logger.error("MIRROR_LANG_INSTRUCTIONS_FAILED error=%r", exc)
 
-    async def _apply_chat_history_limit(
-        self,
-        turn_ctx: lk_llm.ChatContext | None = None,
-        *,
-        trim_turn: bool = False,
-        sync_agent: bool = False,
-    ) -> None:
-        max_messages = _chat_history_max_messages()
-        if max_messages <= 0:
-            return
-        if trim_turn and turn_ctx is not None:
-            removed_turn = _trim_chat_history(
-                turn_ctx, max_messages=max_messages, reserve_incoming=1
-            )
-            if removed_turn:
-                logger.info(
-                    "CHAT_HISTORY_TRIM context=turn removed=%s max_messages=%s",
-                    removed_turn,
-                    max_messages,
-                )
-        if not sync_agent:
-            return
-        try:
-            trimmed = self.chat_ctx.copy()
-        except Exception as exc:
-            logger.warning("CHAT_HISTORY_TRIM_AGENT_COPY_FAILED err=%r", exc)
-            return
-        removed_agent = _trim_chat_history(trimmed, max_messages=max_messages)
-        if removed_agent:
-            await self.update_chat_ctx(trimmed)
-            logger.info(
-                "CHAT_HISTORY_TRIM context=agent removed=%s max_messages=%s",
-                removed_agent,
-                max_messages,
-            )
-
     async def on_user_turn_completed(
         self, turn_ctx: lk_llm.ChatContext, new_message: ChatMessage
     ) -> None:
@@ -1371,7 +1236,6 @@ class MirroringLanguageAgent(Agent):
             pass
 
         await self.apply_mirror_instructions(prepared)
-        await self._apply_chat_history_limit(turn_ctx, trim_turn=True)
 
         llm_input = prepared.llm_user_input()
         if llm_input != prepared.text:
@@ -1392,8 +1256,6 @@ class MirroringLanguageAgent(Agent):
         except Exception as e:
             logger.error("SUPER_CALL_FAILED in on_user_turn_completed: %s", e)
             return
-
-        await self._apply_chat_history_limit(sync_agent=True)
 
         # Natural turn committed — do not fire stuck-pipeline generate_reply() again.
         self._mark_stuck_watch_serviced_if_same_final(prepared.text)
@@ -1551,8 +1413,6 @@ def _infer_commit_stt_lang(text: str, tagged: str | None) -> str | None:
     t = (text or "").strip()
     if not t:
         return tagged
-    if _is_farewell_utterance(t):
-        return "en"
     dev = _devanagari_ratio(t)
     if dev >= 0.12:
         return "hi"
@@ -1572,61 +1432,31 @@ def _normalize_deepgram_language(language: str) -> str:
     return language
 
 
-def _env_optional_positive_int(name: str) -> int | None:
-    raw = os.getenv(name)
-    if raw is None or str(raw).strip() == "":
-        return None
-    try:
-        value = int(raw.strip())
-    except ValueError:
-        logger.warning("CONFIG %s=%r invalid ignoring", name, raw)
-        return None
-    if value <= 0:
-        return None
-    return value
-
-
 def _build_llm_from_env(*, provider: str | None = None) -> Any:
     provider = provider or _env_choice("LLM_PROVIDER", {"openai", "groq"}, default="groq")
     model = os.getenv("LLM_MODEL", "llama-3.1-8b-instant")
     temperature = float(os.getenv("LLM_TEMPERATURE", "0.4"))
-    max_completion_tokens = _env_optional_positive_int("LLM_MAX_TOKENS")
-
-    llm_kwargs: dict[str, Any] = {
-        "model": model,
-        "temperature": temperature,
-    }
-    if max_completion_tokens is not None:
-        llm_kwargs["max_completion_tokens"] = max_completion_tokens
 
     if provider == "groq":
         api_key = os.getenv("GROQ_API_KEY") or os.getenv("OPENAI_API_KEY")
         if not api_key:
             raise RuntimeError("Missing GROQ_API_KEY (or OPENAI_API_KEY) for LLM_PROVIDER=groq")
-        llm_kwargs["api_key"] = api_key
-        llm_kwargs["base_url"] = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
-        logger.info(
-            "LLM_CONFIG provider=groq model=%s max_completion_tokens=%s temperature=%s",
-            model,
-            max_completion_tokens,
-            temperature,
+        base_url = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
+        return openai.LLM(
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
+            temperature=temperature,
         )
-        return openai.LLM(**llm_kwargs)
 
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("Missing OPENAI_API_KEY for LLM_PROVIDER=openai")
-    llm_kwargs["api_key"] = api_key
     base_url = os.getenv("OPENAI_BASE_URL") or None
+    kwargs: dict[str, Any] = {"model": model, "api_key": api_key, "temperature": temperature}
     if base_url:
-        llm_kwargs["base_url"] = base_url
-    logger.info(
-        "LLM_CONFIG provider=openai model=%s max_completion_tokens=%s temperature=%s",
-        model,
-        max_completion_tokens,
-        temperature,
-    )
-    return openai.LLM(**llm_kwargs)
+        kwargs["base_url"] = base_url
+    return openai.LLM(**kwargs)
 
 
 def _llm_credentials_present(provider: str) -> bool:
@@ -1692,10 +1522,18 @@ def _build_agent(
     )
     if "feminine verb agreement" not in instructions.lower():
         instructions = instructions.rstrip() + _nyra_hi_agree
+    _in_gov_roles = (
+        " For India facts: in English, \"President of India\" = राष्ट्रपति; "
+        "\"Prime Minister\" = प्रधानमंत्री — answer exactly the office the user asked for "
+        "(they are different people)."
+    )
+    if "राष्ट्रपति" not in instructions and "president of india" not in instructions.lower():
+        instructions = instructions.rstrip() + _in_gov_roles
     _nyra_identity = (
         " Identity: you are Nyra, a Hinglish voice assistant in this demo. "
-        "You are NOT Meta AI, ChatGPT, Gemini, or owned by Elon Musk — never claim that. "
-        "Boss/owner answers follow AGENT_INSTRUCTIONS only."
+        "You are NOT Meta AI, ChatGPT, Gemini, or owned by Elon Musk. "
+        "If asked who made or owns you, say you were built by your developers for this "
+        "voice assistant — never claim to be part of Meta or any other big-tech product."
     )
     if "meta ai" not in instructions.lower() and "you are nyra" not in instructions.lower():
         instructions = instructions.rstrip() + _nyra_identity
@@ -1798,10 +1636,7 @@ def _build_agent(
         vad=vad,
         allow_interruptions=True,
     )
-    logger.info(
-        "AGENT_INIT_OK class=MirroringLanguageAgent chat_history_max_messages=%s",
-        _chat_history_max_messages(),
-    )
+    logger.info("AGENT_INIT_OK class=MirroringLanguageAgent")
 
     return agent, resolved_pipeline
 
